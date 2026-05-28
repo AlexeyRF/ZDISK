@@ -21,7 +21,6 @@ from io import BytesIO
 
 from zdisk_client import ZDiskClient
 from zdisk_crypto import ZDiskCrypto
-from pymax.crud import Database
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("zdisk_ui")
@@ -195,8 +194,12 @@ class ZDiskApp(QObject):
         self.loop = loop
         
         # Устанавливаем иконку приложения
-        if os.path.exists("icon.png"):
-            self.app.setWindowIcon(QIcon("icon.png"))
+        icon_path = "icon.png"
+        if getattr(sys, "frozen", False):
+            icon_path = os.path.join(sys._MEIPASS, icon_path)
+            
+        if os.path.exists(icon_path):
+            self.app.setWindowIcon(QIcon(icon_path))
         
         self.client = None
         self.main_window = None
@@ -258,10 +261,12 @@ class ZDiskApp(QObject):
         except Exception as e:
             logger.error(f"Error during startup cleanup: {e}")
 
-        db = Database("cache")
-        token = db.get_auth_token()
+        from pymax.session.store import SessionStore
+        store = SessionStore("cache", "session.db")
+        session = await store.load_session()
+        await store.close()
         
-        if token:
+        if session and session.token:
             print(f"Обнаружена существующая сессия. Вход...")
             await self.client.start()
             try:

@@ -4,14 +4,23 @@ import logging
 import json
 from datetime import datetime
 from pathlib import Path
-from pymax import MaxClient, File, AttachType
-from pymax.static.enum import AuthType, DeviceType, Opcode
-from pymax.types import FileAttach, Message
-from pymax.exceptions import WebSocketNotConnectedError
+from pymax import WebClient, File
+from pymax.protocol import Opcode
+from pymax.types import FileAttachment, Message
+from pymax.exceptions import PyMaxError
 from zdisk_crypto import ZDiskCrypto
 from zdisk_files import ZDiskFiles
 import shutil
+
 logger = logging.getLogger("zdisk_client")
+
+class MyQrHandler:
+    def __init__(self, callback):
+        self.callback = callback
+
+    async def show_qr(self, qr_url: str) -> None:
+        if self.callback:
+            self.callback(qr_url)
 
 class ZDiskClient:
     def __init__(self, phone: str = "", work_dir: str = "cache", target_chat_id: int = 0, loop=None):
@@ -19,7 +28,11 @@ class ZDiskClient:
         self.work_dir = work_dir
         self.target_chat_id = target_chat_id
         self.loop = loop or asyncio.get_event_loop()
-        self.client = MaxClient(phone=phone, work_dir=work_dir)
+        self.client = WebClient(
+            session_name="session.db",
+            work_dir=work_dir,
+            qr_provider=MyQrHandler(self._custom_print_qr)
+        )
         self.crypto = ZDiskCrypto()
         self.files = ZDiskFiles()
         
@@ -31,9 +44,7 @@ class ZDiskClient:
         self.on_ready = None # function()
         self.on_qr_received = None # function(link)
         
-        self.client.on_start(self._on_client_start)
-        # Переопределяем метод печати QR, чтобы перехватить ссылку
-        self.client._print_qr = self._custom_print_qr
+        self.client.on_start()(self._on_client_start)
 
     def _custom_print_qr(self, link: str):
         if self.on_qr_received:
@@ -45,7 +56,7 @@ class ZDiskClient:
             qr.add_data(link)
             qr.print_ascii()
 
-    async def _on_client_start(self):
+    async def _on_client_start(self, client=None):
         self.is_authorized = True
         if self.on_ready:
             await self.on_ready()
@@ -62,46 +73,19 @@ class ZDiskClient:
             raise
 
     async def request_code(self):
-        """Requests auth code. Returns temp_token."""
-        # Internal pymax method for requesting code
-        return await self.client.request_code(self.phone)
+        raise NotImplementedError("SMS code auth is deprecated/unused in QR flow")
 
     async def get_qr_data(self):
-        """Requests QR login data. Returns (link, track_id, polling_interval, expires_at)."""
-        data = await self.client._request_qr_login()
-        return data.get("qrLink"), data.get("trackId"), data.get("pollingInterval"), data.get("expiresAt")
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
 
     async def poll_qr_status(self, track_id: str):
-        """Polls for QR login confirmation. Returns True if confirmed, False otherwise."""
-        data = await self.client._send_and_wait(
-            opcode=Opcode.GET_QR_STATUS,
-            payload={"trackId": track_id},
-        )
-        payload = data.get("payload", {})
-        status = payload.get("status", {})
-        return status.get("loginAvailable", False)
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
 
     async def complete_qr_login(self, track_id: str):
-        """Completes the QR login process after confirmation."""
-        data = await self.client._get_qr_login_data(track_id)
-        # data contains tokenAttrs
-        login_attrs = data.get("tokenAttrs", {}).get("LOGIN", {})
-        token = login_attrs.get("token")
-        if token:
-            self.client._token = token
-            self.client._database.update_auth_token(self.client._device_id, token)
-            self.is_authorized = True
-            if not self.auth_future.done():
-                self.auth_future.set_result(True)
-            return True
-        return False
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
 
     async def submit_code(self, temp_token: str, code: str):
-        """Submits auth code."""
-        # Don't start the loop here, just login and return.
-        # The loop should be started by the caller.
-        await self.client.login_with_code(temp_token, code, start=False)
-        return await self.start()
+        raise NotImplementedError("SMS code auth is deprecated/unused in QR flow")
 
     async def _with_retry(self, coro_func, *args, **kwargs):
         """Executes a coroutine function with retries on websocket disconnection."""
@@ -109,16 +93,11 @@ class ZDiskClient:
         for attempt in range(max_retries):
             try:
                 return await coro_func(*args, **kwargs)
-            except (WebSocketNotConnectedError, ConnectionError, asyncio.TimeoutError) as e:
+            except (PyMaxError, ConnectionError, asyncio.TimeoutError) as e:
                 logger.warning(f"Connection error (attempt {attempt+1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    # Try to reconnect
-                    try:
-                        await self.client.connect()
-                        # Give it a moment
-                        await asyncio.sleep(1)
-                    except Exception as re_e:
-                        logger.error(f"Reconnection failed: {re_e}")
+                    # Give automatic reconnection some time
+                    await asyncio.sleep(2)
                 else:
                     raise
         return None
@@ -154,7 +133,7 @@ class ZDiskClient:
         for msg in history:
             if msg.attaches:
                 for attach in msg.attaches:
-                    if isinstance(attach, FileAttach):
+                    if isinstance(attach, FileAttachment):
                         name = attach.name
                         path = ""
                         is_part = False
@@ -278,25 +257,41 @@ class ZDiskClient:
         new_metadata = [m for m in metadata if now - m['deleted_at'] <= limit]
         await self.save_trash_metadata(new_metadata)
 
+    async def edit_message(self, chat_id: int, message_id: int, text: str):
+        """Edits an existing message's text using MSG_EDIT opcode."""
+        from pymax.protocol.enums import Opcode
+        from pymax.formatting.markdown import Formatter
+        import time
+
+        clean_text, elements = Formatter.format_markdown(text)
+        cid = int(time.time() * 1000)
+        
+        payload = {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "message": {
+                "text": clean_text,
+                "cid": cid,
+                "elements": elements,
+                "attaches": []
+            }
+        }
+        return await self._with_retry(self.client._app.invoke, Opcode.MSG_EDIT, payload)
+
     async def rename_file(self, msg_id: int, path: str, new_name: str):
         """Renames a file by editing the message text."""
         full_path = f"{path.strip('/')}/{new_name}" if path else new_name
-        # We need to preserve the prefix (FILE:, MANIFEST:, etc)
-        # For simplicity, we assume we can just get the current message and swap the name.
-        # But MaxClient might not have a direct "get message by id" that returns the text easily without history.
-        # We'll use a generic approach of sending an edit command if supported.
-        new_text = f"FILE:{full_path}" # Simplification, should ideally match original prefix
-        return await self._with_retry(self.client.edit_message, chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
+        new_text = f"FILE:{full_path}"
+        return await self.edit_message(chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
 
     async def move_file(self, msg_id: int, new_path: str, name: str):
         """Moves a file by editing the message text."""
         full_path = f"{new_path.strip('/')}/{name}" if new_path else name
         new_text = f"FILE:{full_path}"
-        return await self._with_retry(self.client.edit_message, chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
+        return await self.edit_message(chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
 
     async def create_folder(self, target_path: str):
         """Creates a folder by uploading a dummy .keeper file."""
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8', dir=str(self.files.temp_dir)) as f:
             f.write("keep_folder")
             temp_path = f.name
@@ -306,7 +301,7 @@ class ZDiskClient:
             await self.client.send_message(
                 text=f"FILE:{target_path.strip('/')}/.keeper",
                 chat_id=self.target_chat_id,
-                attachment=File(path=temp_path)
+                attachments=[File(path=temp_path)]
             )
         finally:
             self.files.cleanup(temp_path)
@@ -356,7 +351,7 @@ class ZDiskClient:
                     msg = await self.client.send_message(
                         text=f"MANIFEST:{full_name_with_path}",
                         chat_id=self.target_chat_id,
-                        attachment=File(path=manifest_file)
+                        attachments=[File(path=manifest_file)]
                     )
                     # Ждем, пока сообщение действительно будет отправлено (id появится)
                     while not msg.id:
@@ -371,7 +366,7 @@ class ZDiskClient:
                         part_msg = await self.client.send_message(
                             text=f"PART:{full_name_with_path}:{i+1}",
                             chat_id=self.target_chat_id,
-                            attachment=File(path=str(part))
+                            attachments=[File(path=str(part))]
                         )
                         # Важно дождаться подтверждения отправки каждой части
                         while not part_msg.id:
@@ -388,7 +383,7 @@ class ZDiskClient:
                     msg = await self.client.send_message(
                         text=f"FILE:{full_name_with_path}",
                         chat_id=self.target_chat_id,
-                        attachment=File(path=current_path)
+                        attachments=[File(path=current_path)]
                     )
                     while not msg.id:
                         await asyncio.sleep(0.5)
