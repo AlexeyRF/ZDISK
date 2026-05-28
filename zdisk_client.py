@@ -185,6 +185,34 @@ class ZDiskClient:
         """Deletes a file (message) from the target chat."""
         return await self._with_retry(self.client.delete_message, chat_id=self.target_chat_id, message_ids=[msg_id], for_me=False)
 
+    async def send_message(self, text: str, chat_id: int, attachments=None):
+        """Sends a message bypassing the markdown formatter to preserve underscores and technical chars."""
+        from pymax.protocol.enums import Opcode
+        from pymax.api.response import require_payload_model
+        from pymax.types.domain import Message
+        import time
+
+        cid = int(time.time() * 1000)
+        
+        attaches = []
+        if attachments:
+            attaches = await self.client._app.api.messages._upload_attachments(attachments)
+
+        payload = {
+            "chatId": chat_id,
+            "message": {
+                "text": text,
+                "cid": cid,
+                "elements": [],
+                "attaches": attaches
+            },
+            "notify": True
+        }
+        
+        response = await self._with_retry(self.client._app.invoke, Opcode.MSG_SEND, payload)
+        message = require_payload_model(response, Message).bind(self.client._app.api.messages)
+        return message
+
     async def load_trash_metadata(self) -> list:
         """Loads trash metadata from the chat history."""
         # Find the latest message starting with "TRASH_METADATA:"
@@ -199,7 +227,17 @@ class ZDiskClient:
                 try:
                     data = json.loads(msg.text[15:])
                     if isinstance(data, list):
-                        return data
+                        # Нормализуем ключи для совместимости с поврежденными сообщениями (без подчеркиваний)
+                        normalized_data = []
+                        for item in data:
+                            normalized_item = {
+                                'name': item.get('name', ''),
+                                'path': item.get('path', ''),
+                                'deleted_at': item.get('deleted_at', item.get('deletedat', 0.0)),
+                                'msg_ids': item.get('msg_ids', item.get('msgids', []))
+                            }
+                            normalized_data.append(normalized_item)
+                        return normalized_data
                 except:
                     continue
         return []
@@ -208,7 +246,7 @@ class ZDiskClient:
         """Saves trash metadata as a message."""
         # We don't delete old metadata messages to avoid edit timeouts, 
         # just send a new one. It will be found as the latest.
-        await self.client.send_message(
+        await self.send_message(
             text=f"TRASH_METADATA:{json.dumps(metadata)}",
             chat_id=self.target_chat_id
         )
@@ -298,7 +336,7 @@ class ZDiskClient:
         
         try:
             # Upload as .keeper
-            await self.client.send_message(
+            await self.send_message(
                 text=f"FILE:{target_path.strip('/')}/.keeper",
                 chat_id=self.target_chat_id,
                 attachments=[File(path=temp_path)]
@@ -348,7 +386,7 @@ class ZDiskClient:
                     manifest_file = prep['manifest_file']
                     
                     # Send manifest first
-                    msg = await self.client.send_message(
+                    msg = await self.send_message(
                         text=f"MANIFEST:{full_name_with_path}",
                         chat_id=self.target_chat_id,
                         attachments=[File(path=manifest_file)]
@@ -363,7 +401,7 @@ class ZDiskClient:
                         if progress_callback:
                             progress_callback(i + 1, len(parts), f"Отправка части {i+1}/{len(parts)}")
                         
-                        part_msg = await self.client.send_message(
+                        part_msg = await self.send_message(
                             text=f"PART:{full_name_with_path}:{i+1}",
                             chat_id=self.target_chat_id,
                             attachments=[File(path=str(part))]
@@ -380,7 +418,7 @@ class ZDiskClient:
                     # Normal upload
                     if progress_callback:
                         progress_callback(0, 1, "Загрузка файла...")
-                    msg = await self.client.send_message(
+                    msg = await self.send_message(
                         text=f"FILE:{full_name_with_path}",
                         chat_id=self.target_chat_id,
                         attachments=[File(path=current_path)]
