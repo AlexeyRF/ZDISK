@@ -637,7 +637,7 @@ class ZDiskApp(QObject):
                     if f_path == folder_path or f_path.startswith(folder_path + "/"):
                         msg_ids.append(f['msg_id'])
                 if permanent:
-                    for mid in mid_ids:
+                    for mid in msg_ids:
                         await self.client.delete_file(mid)
                 else:
                     await self.client.move_to_trash(data['path'].split("/")[-1], data['path'], msg_ids)

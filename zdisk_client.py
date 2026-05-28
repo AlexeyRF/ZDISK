@@ -14,6 +14,31 @@ import shutil
 
 logger = logging.getLogger("zdisk_client")
 
+# Monkeypatch LoginResponse and AuthService in pymax to make 'token' field optional
+# and automatically carry over the current session token if the server response lacks one.
+try:
+    from pymax.types.domain.login import LoginResponse
+    from pymax.api.auth.service import AuthService
+    from typing import Optional
+
+    token_field = LoginResponse.model_fields.get("token")
+    if token_field:
+        token_field.default = None
+        token_field.annotation = Optional[str]
+        LoginResponse.__annotations__["token"] = Optional[str]
+        LoginResponse.model_rebuild(force=True)
+
+    original_login = AuthService.login
+    async def patched_login(self, *args, **kwargs):
+        response = await original_login(self, *args, **kwargs)
+        if response and response.token is None and self.app.session is not None:
+            response.token = self.app.session.token
+        return response
+    AuthService.login = patched_login
+except Exception as e:
+    logger.warning(f"Failed to patch pymax Login: {e}")
+
+
 class MyQrHandler:
     def __init__(self, callback):
         self.callback = callback
@@ -182,34 +207,49 @@ class ZDiskClient:
         return file_messages
 
     async def delete_file(self, msg_id: int):
-        """Deletes a file (message) from the target chat."""
-        return await self._with_retry(self.client.delete_message, chat_id=self.target_chat_id, message_ids=[msg_id], for_me=False)
+        """Deletes a file (including manifest and all parts) from the target chat."""
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        message_ids = [msg_id]
+        if history:
+            manifest_msg = None
+            for m in history:
+                if m.id == msg_id:
+                    manifest_msg = m
+                    break
+            if manifest_msg and manifest_msg.text:
+                if manifest_msg.text.startswith("MANIFEST:"):
+                    full_name = manifest_msg.text[9:]
+                    part_prefix = f"PART:{full_name}:"
+                    for m in history:
+                        if m.text and m.text.startswith(part_prefix):
+                            message_ids.append(m.id)
+        return await self._with_retry(self.client.delete_message, chat_id=self.target_chat_id, message_ids=message_ids, for_me=False)
 
     async def send_message(self, text: str, chat_id: int, attachments=None):
         """Sends a message bypassing the markdown formatter to preserve underscores and technical chars."""
         from pymax.protocol.enums import Opcode
         from pymax.api.response import require_payload_model
         from pymax.types.domain import Message
-        import time
+        from pymax.api.messages.payloads import SendMessagePayload, SendMessagePayloadMessage
 
-        cid = int(time.time() * 1000)
+        cid = self.client._app.api.messages._next_cid()
         
         attaches = []
         if attachments:
             attaches = await self.client._app.api.messages._upload_attachments(attachments)
 
-        payload = {
-            "chatId": chat_id,
-            "message": {
-                "text": text,
-                "cid": cid,
-                "elements": [],
-                "attaches": attaches
-            },
-            "notify": True
-        }
+        frame = SendMessagePayload(
+            chat_id=chat_id,
+            message=SendMessagePayloadMessage(
+                text=text,
+                cid=cid,
+                elements=[],
+                attaches=attaches,
+            ),
+            notify=True
+        )
         
-        response = await self._with_retry(self.client._app.invoke, Opcode.MSG_SEND, payload)
+        response = await self._with_retry(self.client._app.invoke, Opcode.MSG_SEND, frame.to_payload())
         message = require_payload_model(response, Message).bind(self.client._app.api.messages)
         return message
 
@@ -243,29 +283,68 @@ class ZDiskClient:
         return []
 
     async def save_trash_metadata(self, metadata: list):
-        """Saves trash metadata as a message."""
-        # We don't delete old metadata messages to avoid edit timeouts, 
-        # just send a new one. It will be found as the latest.
+        """Saves trash metadata as a message and deletes the old ones."""
+        # Find old trash metadata messages
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        old_metadata_msg_ids = []
+        if history:
+            for msg in history:
+                if msg.text and msg.text.startswith("TRASH_METADATA:"):
+                    old_metadata_msg_ids.append(msg.id)
+        
+        # Send new metadata message
         await self.send_message(
             text=f"TRASH_METADATA:{json.dumps(metadata)}",
             chat_id=self.target_chat_id
         )
+        
+        # Delete old metadata messages
+        if old_metadata_msg_ids:
+            try:
+                await self._with_retry(
+                    self.client.delete_message,
+                    chat_id=self.target_chat_id,
+                    message_ids=old_metadata_msg_ids,
+                    for_me=False
+                )
+            except Exception as e:
+                logger.error(f"Failed to delete old trash metadata messages: {e}")
 
     async def move_to_trash(self, name: str, path: str, msg_ids: list):
-        """Adds items to trash metadata."""
+        """Adds items to trash metadata, automatically including all parts for split files."""
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        resolved_msg_ids = list(msg_ids)
+        if history:
+            for mid in msg_ids:
+                manifest_msg = None
+                for m in history:
+                    if m.id == mid:
+                        manifest_msg = m
+                        break
+                if manifest_msg and manifest_msg.text and manifest_msg.text.startswith("MANIFEST:"):
+                    full_name = manifest_msg.text[9:]
+                    part_prefix = f"PART:{full_name}:"
+                    for m in history:
+                        if m.text and m.text.startswith(part_prefix) and m.id not in resolved_msg_ids:
+                            resolved_msg_ids.append(m.id)
+
         metadata = await self.load_trash_metadata()
+        existing_msg_ids = {mid for m in metadata for mid in m.get('msg_ids', [])}
+        new_msg_ids = [mid for mid in resolved_msg_ids if mid not in existing_msg_ids]
+        if not new_msg_ids:
+            return
+            
         metadata.append({
             'name': name,
             'path': path,
             'deleted_at': datetime.now().timestamp(),
-            'msg_ids': msg_ids
+            'msg_ids': new_msg_ids
         })
         await self.save_trash_metadata(metadata)
 
     async def restore_from_trash(self, item_data: dict):
         """Removes items from trash metadata."""
         metadata = await self.load_trash_metadata()
-        # Filter out the item to restore
         new_metadata = [m for m in metadata if not (m['deleted_at'] == item_data['deleted_at'] and m['name'] == item_data['name'])]
         await self.save_trash_metadata(new_metadata)
 
@@ -276,7 +355,26 @@ class ZDiskClient:
                                    chat_id=self.target_chat_id, 
                                    message_ids=item_data['msg_ids'], 
                                    for_me=False)
-        await self.restore_from_trash(item_data) # Just removes from metadata
+        await self.restore_from_trash(item_data)
+
+    async def clear_all_trash(self):
+        """Permanently deletes all items in the trash and empties it."""
+        metadata = await self.load_trash_metadata()
+        if not metadata:
+            return
+        all_msg_ids = []
+        for item in metadata:
+            if item.get('msg_ids'):
+                all_msg_ids.extend(item['msg_ids'])
+        if all_msg_ids:
+            try:
+                await self._with_retry(self.client.delete_message, 
+                                       chat_id=self.target_chat_id, 
+                                       message_ids=all_msg_ids, 
+                                       for_me=False)
+            except Exception as e:
+                logger.error(f"Failed to bulk delete trash messages: {e}")
+        await self.save_trash_metadata([])
 
     async def cleanup_trash(self):
         """Deletes items older than 30 days from trash."""
