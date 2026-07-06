@@ -4,7 +4,8 @@ import logging
 import json
 from datetime import datetime
 from pathlib import Path
-from pymax import WebClient, File
+from pymax import WebClient, Client, File
+from pymax.auth import ConsolePasswordProvider, PasswordProvider
 from pymax.protocol import Opcode
 from pymax.types import FileAttachment, Message
 from pymax.exceptions import PyMaxError
@@ -47,17 +48,45 @@ class MyQrHandler:
         if self.callback:
             self.callback(qr_url)
 
+class StaticPasswordProvider(PasswordProvider):
+    def __init__(self, password):
+        self.password = password
+    async def get_password(self, hint=None) -> str:
+        if self.password:
+            return self.password
+        provider = ConsolePasswordProvider()
+        return await provider.get_password(hint)
+
 class ZDiskClient:
-    def __init__(self, phone: str = "", work_dir: str = "cache", target_chat_id: int = 0, loop=None):
+    def __init__(self, phone: str = "", work_dir: str = "cache", target_chat_id: int = 0, loop=None, use_tcp: bool = False, two_fa_password: str = None, sms_code_provider=None):
         self.phone = phone
         self.work_dir = work_dir
         self.target_chat_id = target_chat_id
         self.loop = loop or asyncio.get_event_loop()
-        self.client = WebClient(
-            session_name="session.db",
-            work_dir=work_dir,
-            qr_provider=MyQrHandler(self._custom_print_qr)
-        )
+        
+        # Автопроверка: если телефон из списка фейковых, используем WebClient, иначе TCP
+        dummy_phones = {"+12345678900", "+1234567890", "+00000000000", ""}
+        if phone.strip() in dummy_phones:
+            use_tcp = False
+        else:
+            use_tcp = True
+            
+        self.is_tcp = use_tcp
+        
+        if use_tcp:
+            self.client = Client(
+                phone=phone,
+                session_name="session.db",
+                work_dir=work_dir,
+                password_provider=StaticPasswordProvider(two_fa_password) if two_fa_password else ConsolePasswordProvider(),
+                sms_code_provider=sms_code_provider
+            )
+        else:
+            self.client = WebClient(
+                session_name="session.db",
+                work_dir=work_dir,
+                qr_provider=MyQrHandler(self._custom_print_qr)
+            )
         self.crypto = ZDiskCrypto()
         self.files = ZDiskFiles()
         

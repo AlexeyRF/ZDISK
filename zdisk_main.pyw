@@ -70,19 +70,32 @@ class LoginDialog(QDialog):
         layout.addWidget(QLabel("Отсканируйте QR-код через мобильное приложение Max."))
 
 class SettingsDialog(QDialog):
-    def __init__(self, current_chat_id, parent=None):
+    def __init__(self, current_chat_id, current_phone, use_tcp, two_fa_password, parent=None):
         super().__init__(parent)
         self.setWindowTitle("ZDisk - Настройки")
-        self.resize(300, 150)
-        self.setup_ui(current_chat_id)
+        self.resize(350, 250)
+        self.setup_ui(current_chat_id, current_phone, use_tcp, two_fa_password)
 
-    def setup_ui(self, chat_id):
+    def setup_ui(self, chat_id, phone, use_tcp, two_fa_password):
         layout = QVBoxLayout(self)
         form = QFormLayout()
         
         self.chat_id_input = QLineEdit()
         self.chat_id_input.setText(str(chat_id))
         form.addRow("Target Chat ID:", self.chat_id_input)
+
+        self.phone_input = QLineEdit()
+        self.phone_input.setText(phone)
+        form.addRow("Телефон:", self.phone_input)
+
+        self.use_tcp_input = QCheckBox()
+        self.use_tcp_input.setChecked(use_tcp)
+        form.addRow("Использовать TCP:", self.use_tcp_input)
+
+        self.two_fa_input = QLineEdit()
+        self.two_fa_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.two_fa_input.setText(two_fa_password)
+        form.addRow("2FA Пароль:", self.two_fa_input)
         
         layout.addLayout(form)
         
@@ -220,7 +233,7 @@ class ZDiskApp(QObject):
                     return json.load(f)
             except Exception:
                 pass
-        return {"target_chat_id": 0, "passwords": {}, "phone": "+79000000000"}
+        return {"target_chat_id": 0, "passwords": {}, "phone": "+79000000000", "use_tcp": False, "two_fa_password": ""}
 
     def save_settings(self):
         with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
@@ -253,7 +266,19 @@ class ZDiskApp(QObject):
 
     async def start(self):
         phone = self.settings.get("phone", "+79000000000")
-        self.client = ZDiskClient(phone, target_chat_id=self.settings['target_chat_id'], loop=self.loop)
+        use_tcp = self.settings.get("use_tcp", False)
+        two_fa = self.settings.get("two_fa_password", "")
+        
+        class GuiSmsCodeProvider:
+            def __init__(self, app_ref):
+                self.app = app_ref
+            async def get_code(self, phone: str) -> str:
+                code, ok = await self.app._async_dialog(QInputDialog.getText, self.app.login_dialog, "SMS код", f"Введите код для {phone}:")
+                if ok:
+                    return code
+                return ""
+
+        self.client = ZDiskClient(phone, target_chat_id=self.settings.get('target_chat_id', 0), loop=self.loop, use_tcp=use_tcp, two_fa_password=two_fa, sms_code_provider=GuiSmsCodeProvider(self))
         
         # Cleanup temp files from previous sessions
         try:
@@ -280,8 +305,36 @@ class ZDiskApp(QObject):
 
     def show_login(self):
         self.login_dialog = LoginDialog()
-        self.login_dialog.qr_btn.clicked.connect(self.on_qr_login)
+        
+        if getattr(self.client, 'is_tcp', False):
+            self.login_dialog.qr_btn.setText("Войти через SMS")
+            self.login_dialog.status_label.setText("Нажмите 'Войти через SMS' для входа через TCP")
+            self.login_dialog.qr_btn.clicked.connect(self.on_sms_login)
+        else:
+            self.login_dialog.qr_btn.clicked.connect(self.on_qr_login)
+            
         self.login_dialog.show()
+
+    @asyncSlot()
+    async def on_sms_login(self):
+        try:
+            self.login_dialog.qr_btn.setEnabled(False)
+            self.login_dialog.status_label.setText("Подключение по TCP...")
+            
+            await self.client.start()
+            
+            try:
+                await asyncio.wait_for(self.client.auth_future, timeout=300)
+                self.login_dialog.accept()
+                self.show_main_window()
+            except asyncio.TimeoutError:
+                self.login_dialog.status_label.setText("Время ожидания истекло. Попробуйте снова.")
+                self.login_dialog.qr_btn.setEnabled(True)
+                
+        except Exception as e:
+            logger.error(f"TCP/SMS Login error: {e}")
+            await self._async_dialog(QMessageBox.critical, self.login_dialog, "Ошибка Входа", str(e))
+            self.login_dialog.qr_btn.setEnabled(True)
 
     @asyncSlot()
     async def on_qr_login(self):
@@ -715,13 +768,23 @@ class ZDiskApp(QObject):
             await self._async_dialog(QMessageBox.critical, dialog, "Ошибка", str(e))
 
     def show_settings(self):
-        dialog = SettingsDialog(self.settings['target_chat_id'], self.main_window)
+        dialog = SettingsDialog(
+            self.settings.get('target_chat_id', 0),
+            self.settings.get('phone', ''),
+            self.settings.get('use_tcp', False),
+            self.settings.get('two_fa_password', ''),
+            self.main_window
+        )
         if dialog.exec():
             try:
                 new_id = int(dialog.chat_id_input.text())
                 self.settings['target_chat_id'] = new_id
-                self.client.target_chat_id = new_id
+                self.settings['phone'] = dialog.phone_input.text()
+                self.settings['use_tcp'] = dialog.use_tcp_input.isChecked()
+                self.settings['two_fa_password'] = dialog.two_fa_input.text()
                 self.save_settings()
+                self.client.target_chat_id = new_id
+                # Note: to apply use_tcp the app needs a restart, but we save it here
                 self.refresh_files()
             except ValueError:
                 QMessageBox.warning(self.main_window, "Ошибка", "Некорректный ID")
